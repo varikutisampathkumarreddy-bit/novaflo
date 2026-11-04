@@ -1,48 +1,99 @@
 import { NextResponse } from "next/server";
+import { clientIp, rateLimit } from "@/lib/rate-limit";
 import { validateContact } from "@/lib/validation";
-import { rateLimit, clientIp } from "@/lib/rate-limit";
-import { addLead, forwardToWebhook } from "@/lib/leads";
+import {
+  addLead,
+  forwardToWebhook,
+  forwardToGoogleSheets,
+} from "@/lib/leads";
 import { readAttribution } from "@/lib/attribution";
+import { sendLeadNotification } from "@/lib/email";
+import { readJsonBody } from "../../../../lib/request-body";
+
+export const runtime = "nodejs";
 
 export async function POST(request: Request) {
   const ip = clientIp(request.headers);
-  const { allowed, retryAfterSeconds } = rateLimit(`ct:${ip}`, { max: 5, windowMs: 10 * 60 * 1000 });
-  if (!allowed) {
+
+  const limit = rateLimit(`ct:${ip}`, {
+    max: 5,
+    windowMs: 10 * 60 * 1000,
+  });
+
+  if (!limit.allowed) {
     return NextResponse.json(
-      { error: "Too many submissions. Please try again later." },
-      { status: 429, headers: { "Retry-After": String(retryAfterSeconds) } }
+      {
+        ok: false,
+        error: "Too many requests. Please try again later.",
+      },
+      {
+        status: 429,
+        headers: {
+          "Retry-After": String(limit.retryAfterSeconds),
+        },
+      },
     );
   }
 
-  let body: unknown;
+  const body = await readJsonBody(request);
+
+  if (!body.ok) {
+    return NextResponse.json(
+      { ok: false, error: body.error },
+      { status: body.status },
+    );
+  }
+
+  const result = validateContact(body.value);
+
+  if (!result.value || Object.keys(result.errors).length > 0) {
+    return NextResponse.json(
+      { ok: false, errors: result.errors },
+      { status: 400 },
+    );
+  }
+
+  let lead;
+
   try {
-    body = await request.json();
-  } catch {
-    return NextResponse.json({ error: "Invalid request." }, { status: 400 });
+    const attribution = await readAttribution();
+
+    lead = await addLead({
+      ...result.value,
+      ...attribution,
+      type: "contact",
+    });
+  } catch (error) {
+    console.error("Failed to save contact lead:", error);
+
+    return NextResponse.json(
+      {
+        ok: false,
+        error: "Unable to submit your request right now.",
+      },
+      { status: 503 },
+    );
   }
 
-  const { errors, value } = validateContact(body);
-  if (!value) {
-    return NextResponse.json({ errors }, { status: 400 });
+  // Firestore is the primary store. Integration failures must not
+  // turn an already-saved lead into a failed form submission.
+  const integrations = await Promise.allSettled([
+    forwardToWebhook(lead),
+    forwardToGoogleSheets(lead),
+    sendLeadNotification(lead),
+  ]);
+
+  for (const integration of integrations) {
+    if (integration.status === "rejected") {
+      console.error(
+        "Contact lead integration failed:",
+        integration.reason,
+      );
+    }
   }
 
-  const attribution = await readAttribution();
-
-  const lead = await addLead({
-    type: "contact",
-    name: value.name,
-    business: value.business,
-    phone: value.phone,
-    email: value.email,
-    subject: value.subject,
-    message: value.message,
-    contactMethod: value.contactMethod,
-    source: attribution.source,
-    landingPage: attribution.landingPage,
-    utm: attribution.utm,
-  });
-
-  await forwardToWebhook(lead);
-
-  return NextResponse.json({ ok: true, id: lead.id }, { status: 201 });
+  return NextResponse.json(
+    { ok: true, id: lead.id },
+    { status: 201 },
+  );
 }

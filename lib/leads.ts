@@ -1,13 +1,6 @@
 import "server-only";
-import { promises as fs } from "fs";
-import path from "path";
-
-/**
- * Zero-dependency lead storage.
- * Writes leads to a JSON file outside the public webroot (default ./.data).
- * When CRM_WEBHOOK_URL is configured, submissions are also forwarded.
- * Swap this module for a database integration later — the interface is tiny.
- */
+import { FieldValue } from "firebase-admin/firestore";
+import { adminDb } from "@/lib/firebase-admin";
 
 export interface LeadRecord {
   id: string;
@@ -30,68 +23,123 @@ export interface LeadRecord {
   utm: Record<string, string>;
 }
 
-function leadsDir(): string {
-  return process.env.LEADS_DIR || path.join(process.cwd(), ".data");
-}
+const leadsCollection = () => adminDb.collection("leads");
 
-function leadsFile(): string {
-  return path.join(leadsDir(), "leads.json");
-}
-
-async function ensureDir(): Promise<void> {
-  await fs.mkdir(leadsDir(), { recursive: true });
+function toLeadRecord(
+  id: string,
+  data: FirebaseFirestore.DocumentData,
+): LeadRecord {
+  return {
+    ...data,
+    id,
+    createdAt:
+      typeof data.createdAt === "string"
+        ? data.createdAt
+        : data.createdAt?.toDate?.()?.toISOString?.() ??
+          new Date(0).toISOString(),
+  } as LeadRecord;
 }
 
 export async function readLeads(): Promise<LeadRecord[]> {
-  try {
-    const raw = await fs.readFile(leadsFile(), "utf8");
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-export async function writeLeads(leads: LeadRecord[]): Promise<void> {
-  await ensureDir();
-  await fs.writeFile(leadsFile(), JSON.stringify(leads, null, 2), "utf8");
+  const snapshot = await leadsCollection().get();
+  return snapshot.docs.map((doc: any) => toLeadRecord(doc.id, doc.data()));
 }
 
 export async function addLead(
-  lead: Omit<LeadRecord, "id" | "createdAt" | "status">
+  lead: Omit<LeadRecord, "id" | "createdAt" | "status">,
 ): Promise<LeadRecord> {
-  const record: LeadRecord = {
+  const record = {
     ...lead,
-    id: `lead_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     createdAt: new Date().toISOString(),
-    status: "new",
+    status: "new" as const,
   };
-  const leads = await readLeads();
-  leads.push(record);
-  await writeLeads(leads);
-  return record;
+
+  // Firestore does not accept undefined field values.
+  const firestoreRecord = Object.fromEntries(
+    Object.entries(record).filter(([, value]) => value !== undefined),
+  );
+
+  const docRef = leadsCollection().doc();
+
+  await docRef.set({
+    ...firestoreRecord,
+    id: docRef.id,
+    createdAt: FieldValue.serverTimestamp(),
+  });
+
+  return {
+    ...record,
+    id: docRef.id,
+  };
 }
 
-export async function updateLeadStatus(id: string, status: LeadRecord["status"]): Promise<boolean> {
-  const leads = await readLeads();
-  const idx = leads.findIndex((l) => l.id === id);
-  if (idx === -1) return false;
-  leads[idx].status = status;
-  await writeLeads(leads);
+export async function updateLeadStatus(
+  id: string,
+  status: LeadRecord["status"],
+): Promise<boolean> {
+  const docRef = leadsCollection().doc(id);
+  const snapshot = await docRef.get();
+
+  if (!snapshot.exists) return false;
+
+  await docRef.update({ status });
   return true;
 }
 
-/** Fire-and-forget forwarding to CRM/automation webhook when configured. */
+/** Forward a newly created lead to a configured CRM webhook. */
 export async function forwardToWebhook(lead: LeadRecord): Promise<void> {
   const url = process.env.CRM_WEBHOOK_URL?.trim();
   if (!url) return;
+
   try {
-    await fetch(url, {
+    const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ event: "lead.created", lead }),
     });
-  } catch {
-    /* never let webhook failures break form submissions */
+
+    if (!response.ok) {
+      console.error("Lead webhook returned HTTP", response.status);
+    }
+  } catch (error) {
+    console.error("Lead webhook forwarding failed:", error);
   }
 }
+
+/** Forward a newly created lead to the optional Google Sheets receiver. */
+export async function forwardToGoogleSheets(
+  lead: LeadRecord,
+): Promise<void> {
+  const url = process.env.GOOGLE_SHEETS_WEBHOOK_URL?.trim();
+  const secret = process.env.GOOGLE_SHEETS_WEBHOOK_SECRET?.trim();
+
+  // Google Sheets integration remains optional until configured.
+  if (!url || !secret) return;
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        event: "lead.created",
+        secret,
+        lead,
+      }),
+      signal: AbortSignal.timeout(8000),
+      cache: "no-store",
+    });
+
+    if (!response.ok) {
+      console.error(
+        "Google Sheets integration returned HTTP",
+        response.status,
+      );
+    }
+  } catch (error) {
+    // A Sheets outage must not invalidate a lead already saved in Firestore.
+    console.error("Google Sheets forwarding failed:", error);
+  }
+}
+
